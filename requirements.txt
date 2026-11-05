@@ -1,0 +1,10 @@
+streamlit>=1.40
+pdfplumber>=0.11
+pytesseract>=0.3.13
+pdf2image>=1.17
+rapidfuzz>=3.10
+pandas>=2.2
+plotly>=5.24
+reportlab>=4.2
+anthropic>=0.40
+python-dateutil>=2.9
