@@ -1,7 +1,0 @@
-__pycache__/
-*.pyc
-.pytest_cache/
-data/processing_history.db
-data/_upload_*
-.venv/
-venv/
