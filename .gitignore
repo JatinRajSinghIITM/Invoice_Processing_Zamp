@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+data/processing_history.db
+data/uploads/
+data/_upload_*
+.venv/
+venv/
+real_invoices/
