@@ -63,13 +63,24 @@ def check_duplicate(extracted: ExtractedInvoice, current_invoice_id: str, ws=Non
     candidates = [c for c in candidates if c["invoice_id"] != current_invoice_id
                   and c.get("effective_status", c["decision_status"]) != "Rejected"]
     if candidates:
-        match = candidates[0]
-        dc.is_duplicate = True
-        dc.matched_invoice_id = match["invoice_id"]
-        if match["invoice_number"] == extracted.invoice_number:
+        # Same vendor + same invoice number is the same invoice: a certain duplicate.
+        same_number = [c for c in candidates
+                       if extracted.invoice_number and c["invoice_number"] == extracted.invoice_number]
+        if same_number:
+            match = same_number[0]
+            dc.is_duplicate = True
+            dc.matched_invoice_id = match["invoice_id"]
             dc.reason = f"Same vendor + same invoice number as already-processed invoice {match['invoice_id']}"
         else:
-            dc.reason = f"Same vendor, amount and date as already-processed invoice {match['invoice_id']}"
+            # Different invoice numbers but same vendor, amount and date. Two real orders
+            # can look like this (e.g. two identical purchases on one day), so do not
+            # reject -- flag it and let a person decide.
+            match = candidates[0]
+            dc.possible = True
+            dc.matched_invoice_id = match["invoice_id"]
+            dc.reason = (f"Possible duplicate: same vendor, amount and date as invoice {match['invoice_id']} "
+                         f"(invoice no. {match['invoice_number']}), but a different invoice number "
+                         f"({extracted.invoice_number or 'none read'})")
     return dc
 
 
@@ -112,6 +123,8 @@ def decide(extracted: ExtractedInvoice, vendor_match: VendorMatch, po_match: POM
 
     if duplicate_check.is_duplicate:
         reject_reasons.append(f"Duplicate invoice: {duplicate_check.reason}.")
+    elif duplicate_check.possible:
+        review_reasons.append(f"{duplicate_check.reason}. Confirm these are two separate invoices before paying.")
 
     if vendor_match.matched and not vendor_match.is_approved:
         reject_reasons.append(f"Vendor '{vendor_match.matched_name}' is in the master but not currently approved (inactive).")

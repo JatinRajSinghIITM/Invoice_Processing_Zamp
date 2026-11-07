@@ -121,6 +121,8 @@ def run_pipeline(pdf_path: str, filename: str, ws=None, use_ai: bool = True):
     dup_check = rules.check_duplicate(extracted, invoice_id, ws=ws)
     if dup_check.is_duplicate:
         yield emit("9. Duplicate detection", "fail", "Duplicate invoice detected", dup_check.reason)
+    elif dup_check.possible:
+        yield emit("9. Duplicate detection", "warning", "Possible duplicate - needs a person to confirm", dup_check.reason)
     else:
         yield emit("9. Duplicate detection", "ok", "No duplicate found in processing history")
 

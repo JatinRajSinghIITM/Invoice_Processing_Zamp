@@ -74,7 +74,8 @@ class POMatch:
 
 @dataclass
 class DuplicateCheck:
-    is_duplicate: bool = False
+    is_duplicate: bool = False      # certain: same vendor AND same invoice number -> reject
+    possible: bool = False          # unsure: different invoice numbers, same vendor/amount/date -> a person decides
     reason: Optional[str] = None
     matched_invoice_id: Optional[str] = None
 
