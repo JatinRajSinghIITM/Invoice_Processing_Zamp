@@ -210,3 +210,55 @@ def test_missing_invoice_number_needs_review():
     result = run_and_get_result("08_bonus_missing_fields_sterling.pdf")
     assert result.decision.status == "Needs Review"
     assert "Invoice number" in result.extracted.missing_fields()
+
+
+# ------------------------------------------------ Duplicate: certain vs possible
+
+def _make_coral_like(tmp_path, invoice_number, name):
+    sys.path.insert(0, str(ROOT / "sample_invoices"))
+    from generate_samples import make_digital_pdf
+    p = tmp_path / name
+    make_digital_pdf(
+        p, vendor_name="Coral Facilities Management",
+        invoice_number=invoice_number, invoice_date="2026-10-10", po_number="PO-5005",
+        line_items=[("Monthly Facilities Maintenance - Oct 2026", 54000.00)],
+        subtotal=45762.71, tax=8237.29, total=54000.00,
+    )
+    return p
+
+
+def _run(path):
+    result = None
+    for item in run_pipeline(str(path), path.name):
+        if hasattr(item, "decision"):
+            result = item
+    return result
+
+
+def test_same_amount_and_date_but_different_invoice_number_is_review_not_reject(tmp_path):
+    """Two genuine invoices can share vendor, amount and date. That is a question
+    for a person, not an automatic rejection. (Tested on the duplicate rule and the
+    decision engine directly, so PO balance does not muddy the result.)"""
+    first = _run(_make_coral_like(tmp_path, "INV-CFM-1001", "a.pdf"))
+    assert first.decision.status == "Approved"
+
+    other = ExtractedInvoice(vendor_name_raw=first.extracted.vendor_name_raw, invoice_number="INV-CFM-1002",
+                             invoice_date=first.extracted.invoice_date, total=first.extracted.total,
+                             extraction_confidence=1.0)
+    dup = rules.check_duplicate(other, "INV-RUN-new")
+    assert dup.possible and not dup.is_duplicate
+    assert "different invoice number" in dup.reason
+
+    vm = VendorMatch(matched=True, is_approved=True, vendor_id="V-1", matched_name="X")
+    po = POMatch(matched=True, po_number="PO-1", po_amount=100000.0, remaining_po_balance=100000.0)
+    decision = rules.decide(other, vm, po, dup)
+    assert decision.status == "Needs Review"
+    assert "Possible duplicate" in " ".join(decision.reasons)
+
+
+def test_same_invoice_number_is_still_a_certain_duplicate(tmp_path):
+    first = _run(_make_coral_like(tmp_path, "INV-CFM-2001", "a.pdf"))
+    assert first.decision.status == "Approved"
+    second = _run(_make_coral_like(tmp_path, "INV-CFM-2001", "b.pdf"))
+    assert second.decision.status == "Rejected"
+    assert second.duplicate_check.is_duplicate and not second.duplicate_check.possible
