@@ -92,6 +92,31 @@ def make_scanned_pdf(path, vendor_name, invoice_number, invoice_date, po_number,
     os.remove(tmp_png)
 
 
+def make_unusual_layout_pdf(path):
+    """A digital invoice whose labels the pattern parser does not know
+    ("Document Ref.", "Dated", "Please remit"). Text is perfectly readable to a
+    person (or a language model) but invisible to the regexes, so it is the
+    sample that shows what the optional AI step is for."""
+    lines = [
+        "Orbit Telecom Solutions", "Plot 14, SEEPZ, Hyderabad, TS 500081", "",
+        "TAX INVOICE", "",
+        "Document Ref.: TI/2026/0417",
+        "Dated: 14 October 2026",
+        "Against Purchase Order: PO-5007", "",
+        "Billed to: Acme Corp, Accounts Payable Dept.", "",
+        "Leased line rental - Q4 2026", "Taxable value        Rs 15,889.83", "GST @ 18%             Rs 2,860.17", "",
+        "Please remit Rs 18,750.00 within 30 days.",
+    ]
+    c = canvas.Canvas(str(path), pagesize=A4)
+    _, height = A4
+    c.setFont("Helvetica", 11)
+    y = height - 60
+    for line in lines:
+        c.drawString(50, y, line)
+        y -= 18
+    c.save()
+
+
 def generate_all():
     OUT_DIR.mkdir(exist_ok=True)
 
@@ -181,6 +206,8 @@ def generate_all():
         subtotal=15254.24, tax=2745.76, total=18000.00,
         omit_invoice_number=True, omit_po=True,
     )
+
+    make_unusual_layout_pdf(OUT_DIR / "09_ai_unusual_layout_orbit.pdf")
 
     print("Generated sample invoices in", OUT_DIR)
     for f in sorted(OUT_DIR.glob("*.pdf")):
