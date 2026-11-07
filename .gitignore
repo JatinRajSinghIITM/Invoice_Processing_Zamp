@@ -1,9 +1,20 @@
+# Python cache
 __pycache__/
 *.pyc
+
+# Testing
 .pytest_cache/
+
+# Databases
 data/processing_history.db
+
+# Uploaded data files
 data/uploads/
 data/_upload_*
+
+# Virtual environments
 .venv/
 venv/
+
+# Specific data/invoice folders
 real_invoices/
