@@ -14,7 +14,7 @@ pip install -r requirements.txt
 #   macOS:  brew install tesseract poppler
 #   Ubuntu: sudo apt-get install tesseract-ocr poppler-utils
 
-python sample_invoices/generate_samples.py   # (re)generates the 9 sample test PDFs
+python sample_invoices/generate_samples.py   # (re)generates the 10 sample test PDFs
 streamlit run app.py
 ```
 
@@ -23,21 +23,23 @@ you can inspect the vendor master / PO dataset. In the main panel, choose
 **Use a sample invoice** and pick one from the dropdown — each has a one-line
 description of what it's testing — then click **Run processing pipeline**.
 
-Optional: to exercise the LLM-assist path (used only when deterministic
-extraction confidence is low), set `ANTHROPIC_API_KEY` before launching.
-Without it, the app runs fully offline/deterministically and still passes all
-tests and edge cases — see *Design decisions* below for why this is safe.
+Optional: to turn on the AI step (see *AI assist* below), set
+`ANTHROPIC_API_KEY` before launching (locally, an environment variable; on
+Streamlit Cloud, a secret). Without it the app runs fully deterministically
+and still passes all tests and edge cases.
 
 ### Running the test suite
 ```bash
 pytest tests/ -v
 ```
-35 unit + integration tests: the tolerance-band math and fuzzy matching in
+86 unit + integration tests: the tolerance-band math and fuzzy matching in
 isolation, 9 regression tests locked in from real-world invoices that broke
 earlier versions of extraction (see *Extraction hardening* below), the full
-pipeline against every sample invoice (happy path + edge cases), and a
-second file covering per-visitor isolation, bring-your-own vendor/PO data,
-re-runs, and the human review override (see *Review queue* below).
+pipeline against every sample invoice (happy path + edge cases), per-visitor
+isolation, bring-your-own vendor/PO data, re-runs and the human review
+override (see *Review queue*), the guarded AI step with a stubbed model (no
+network, no key needed), the GST/currency checks, the exports, the
+reviewer alerts (network stubbed), and the REST API (skipped if FastAPI is not installed).
 
 ## What Zamp is testing, and how this submission addresses it
 
@@ -47,7 +49,7 @@ re-runs, and the human review override (see *Review queue* below).
 | Explainable decisions | Every `Decision` carries a `reasons` list built from the exact rule that fired — shown in both the live run view and the audit JSON |
 | Edge cases handled deliberately, not with errors | See *Edge cases* below — each one produces a specific, reasoned outcome, never a crash or a generic error |
 | Intuitive UI + live run view + dashboard | `app.py`: stage-by-stage live view, color-coded by status, plus a full dashboard tab (history table, decision breakdown chart, drill-down) |
-| Judgment on AI vs. deterministic logic | AI (optional LLM assist) only touches *document understanding* on low-confidence extractions; all financial math and the final decision are plain Python, always reproducible |
+| Judgment on AI vs. deterministic logic | AI only *reads* hard documents, behind a key, a spending cap and a check that every value it returns appears in the document; all financial math and the final decision are plain Python, always reproducible — see *AI assist* |
 | Robust to real-world input, not just synthetic samples | Extraction was hardened against real third-party invoices during development — see *Extraction hardening* below |
 | A decision that doesn't dead-end | **Needs Review** is a working queue: a person approves or rejects it, the system's own call and the human's call are both kept in the audit trail — see *Review queue* below |
 | Safe to share as a live link | Every visitor gets a private workspace (own history, own vendor/PO data), so strangers testing the link never see or break each other's runs — see *Per-visitor workspaces* below |
@@ -56,19 +58,25 @@ re-runs, and the human review override (see *Review queue* below).
 
 ```
 PDF in → [1] Accept → [2] Extract text (digital layer, OCR fallback if none)
-       → [3] Parse fields (regex, deterministic) → [LLM assist only if confidence < 60%]
-       → [4] Completeness check → [5] Vendor validation (fuzzy match vs. approved master)
-       → [6] PO matching (exact → fuzzy → vendor+amount fallback, split-PO aware)
-       → [7] Financial validation (tolerance bands, deterministic)
-       → [8] Duplicate detection (vendor+invoice# and vendor+amount+date fingerprints)
-       → [9] Decision engine (rule-based) → [10] Audit trail (SQLite) → Dashboard
+       → [3] Parse fields (regex, deterministic) → [AI assist only if low confidence / key field missing]
+       → [4] Completeness check → [5] GST & currency checks (GSTIN checksum, tax type, currency)
+       → [6] Vendor validation (fuzzy match vs. approved master)
+       → [7] PO matching (exact → fuzzy → vendor+amount fallback, split-PO aware)
+       → [8] Financial validation (tolerance bands, deterministic)
+       → [9] Duplicate detection (vendor+invoice# and vendor+amount+date fingerprints)
+       → [10] Decision engine (rule-based) → [11] Audit trail (SQLite) → Dashboard / exports
 ```
 
 **Modules** (`core/`):
 - `models.py` — the dataclasses every stage passes between each other (the contract)
 - `extraction.py` — stages 2-3: pdfplumber → OCR fallback → regex field parsing → optional LLM assist
 - `matching.py` — stages 5-6: vendor fuzzy match, PO exact/fuzzy/fallback match, split-PO balance tracking
-- `rules.py` — stages 7-9: tolerance bands, duplicate rules, the decision policy (fully documented in its docstring)
+- `compliance.py` — stage 5: GSTIN format + checksum, tax type vs. supply states, CGST = SGST, currency
+- `ai_assist.py` — the guarded AI step (key, spending caps, grounding check, graceful failure)
+- `export.py` — audit trail as CSV / Excel, and approved invoices as accounting-style "bill" JSON
+- `notify.py` — optional webhook alert when an invoice needs review
+- `api.py` (project root) — REST API over the same pipeline
+- `rules.py` — stages 8-10: tolerance bands, duplicate rules, the decision policy (fully documented in its docstring)
 - `database.py` — SQLite audit trail + PO consumption ledger + reviewer overrides
 - `workspace.py` — per-visitor workspace (own SQLite file, own vendor/PO CSVs, own uploads folder)
 - `pipeline.py` — orchestrates all stages as a generator, so the UI's live view and the CLI/test harness share one code path
@@ -164,6 +172,113 @@ wrong **Approved**. The regression tests in `tests/test_pipeline.py`
 text patterns from that real invoice, so this class of bug can't silently
 come back.
 
+## AI assist (reading hard documents, never deciding)
+
+The pattern parser reads clean invoices on its own. The optional AI step
+exists for the rest: a layout whose labels it doesn't know, or a messy scan.
+It runs only when parse confidence is below 60% or a critical field is
+missing, so a clean invoice never touches the network. Because the app is on
+a public link and the text it reads is untrusted, the step is fenced in:
+
+1. **Key and caps.** The key comes from `ANTHROPIC_API_KEY` (Streamlit Cloud
+   secrets are exposed as environment variables). No key means no AI, and the
+   sidebar and stage view say so. There is a per-session and a per-day call
+   limit (`ZAMP_LLM_MAX_PER_SESSION`, `ZAMP_LLM_MAX_PER_DAY`).
+2. **Gaps only.** The model can fill a field the parser left empty; it can
+   never overwrite a value the parser already read.
+3. **Grounding.** Every value must appear in the document's own text: a
+   number must be one of the numbers printed on the page, a name or invoice
+   number must be a substring, a date must be printable in a common format
+   found in the text. A value the model invented, or one a prompt-injected
+   instruction in the PDF tried to smuggle in, is discarded and reported.
+4. **Strict parsing and graceful failure.** JSON only, typed and range-checked;
+   a timeout, API error or malformed reply degrades to the deterministic
+   result. The pipeline never crashes because the model was unavailable.
+5. **Honest confidence.** AI-supplied fields are re-scored and discounted, and
+   the run view lists exactly which fields the AI read.
+6. **The decision is still plain Python.** The AI never sees the PO data and
+   never approves, rejects or flags anything.
+
+`sample_invoices/09_ai_unusual_layout_orbit.pdf` is built to show it: its
+labels ("Document Ref.", "Dated", "Please remit") defeat the patterns, so
+without a key it goes to **Needs Review** listing what is missing; with a key
+the AI reads the fields, each is verified against the page, and it is
+**Approved**. The tests prove all of this with a stubbed model.
+
+## GST and currency checks (stage 5)
+
+Deterministic checks on the supplier's invoice, added after testing real
+Indian invoices that print GSTINs and CGST/SGST/IGST columns:
+
+- **GSTIN format and check character.** The 15th character is computed from
+  the first 14, so a mistyped or invented GSTIN almost always fails. (A pass
+  does not prove registration; that needs the GST portal.)
+- **State code** must be a real Indian state code.
+- **Tax type vs. supply.** Supplier and place of supply in the same state
+  means CGST + SGST; different states mean IGST. The real invoices include
+  one of each (Tamil Nadu to Tamil Nadu, and Haryana to Tamil Nadu).
+- **CGST total equals SGST total.**
+- **Currency.** The PO data is in rupees; an invoice in USD/EUR/GBP is routed
+  to review rather than compared against a rupee PO with a guessed conversion.
+
+A failed check becomes a plain-English **Needs Review** reason; none of them
+rejects an invoice by itself. All seven real invoices pass with no false flags.
+
+## Exports and accounting hand-off
+
+The dashboard has **Download audit trail (CSV)** and **Download Excel** (two
+sheets: the full trail, and approved bills ready to post). Every approved
+invoice, whether approved by the rules or by a reviewer, can be downloaded
+as a `bill` JSON: vendor id and GSTIN, bill number and date, PO, amounts,
+and who approved it. That payload is the hand-off a real deployment would
+POST to an accounting system (Zoho Books, Tally, QuickBooks); no external
+system is called here.
+
+## Batch upload
+
+Choose **Upload several PDFs (batch)** to process many invoices in one go. A
+progress bar runs through them, one unreadable file never stops the rest, and
+a summary table shows each file's decision and main reason. Anything that
+needs a person lands in the Dashboard's review queue.
+
+## REST API
+
+`api.py` exposes the same pipeline as a REST service, so another system (an
+email listener, an ERP, a workflow tool) can submit invoices without a person
+using the UI. It calls the same core modules, so the API and the app can't
+disagree.
+
+```bash
+pip install -r requirements-api.txt
+uvicorn api:app --reload                 # interactive docs: http://localhost:8000/docs
+
+curl -F "file=@sample_invoices/01_happy_path_nimbus.pdf" http://localhost:8000/v1/invoices
+```
+
+| Route | What it does |
+|---|---|
+| `POST /v1/invoices` | Upload a PDF; returns the decision, reasons, all 11 stages, extracted fields and (if approved) the bill JSON. `?use_ai=false` keeps it deterministic |
+| `GET /v1/invoices`, `GET /v1/invoices/{id}` | History and one run, with the reviewer decision if any |
+| `POST /v1/invoices/{id}/review` | A reviewer approves or rejects a Needs Review invoice |
+| `POST /v1/vendors`, `POST /v1/purchase-orders` | Add reference data |
+| `GET /health` | Liveness |
+
+Safeguards: optional `API_KEY` (sent as `X-API-Key`), PDF-only with a 10 MB
+cap, the client's file name is never used as a path, a corrupt PDF is a clean
+422, and each `X-Client-Id` gets its own private audit trail and reference
+data. It runs locally; the live Streamlit link serves the UI only, because
+Streamlit Cloud hosts one app per repo.
+
+## Reviewer alerts
+
+Set `ALERT_WEBHOOK_URL` (a Slack-style incoming webhook; Teams and Discord have
+compatible ones) and a short message is sent whenever an invoice lands in the
+review queue: file name, vendor, total, the first reason and the invoice id.
+Off by default. https only, short timeout, a failed send never affects the
+pipeline, untrusted text is flattened and escaped (so a `<!channel>` hidden in
+a PDF can't ping a workspace), and a daily cap (`ALERT_MAX_PER_DAY`) stops a
+flood of uploads. The sidebar says when alerts are on.
+
 ## Per-visitor workspaces
 
 A public link means strangers use the same running app. With one shared
@@ -231,9 +346,16 @@ Every scenario's expected outcome is codified as a pytest assertion in
   invoices the system marked Needs Review
 - Workspaces live in the host's temp folder, so on a free cloud host they
   disappear when the app restarts — fine for a demo, not an AP system of record
-- One invoice at a time; no batch upload or CSV export of the audit trail
-- LLM assist is single-shot with no retry/validation loop; a production
-  version would validate the LLM's JSON against a schema and retry on failure
+- Multi-currency is detected and routed to review, not converted; line-item
+  reconciliation and GST rate validation per HSN code are not attempted
+- The AI step makes one call per document and is validated rather than
+  retried; a production version would add retries with backoff and measure
+  extraction accuracy against a labelled invoice set
+- No real ERP connection: the bill JSON is the hand-off payload, not a live
+  integration, and the REST API runs locally rather than on the live link.
+  Email intake (forward an invoice to an inbox and have it processed) is the
+  natural next step; it needs a mail account with OAuth and an always-on
+  worker, which is beyond a one-file Streamlit deployment
 - No multi-line-item / bundled-line-item parsing — the pipeline reads totals,
   not itemized reconciliation
 - SQLite is fine for a single-user demo; concurrent AP-team usage would need
@@ -249,8 +371,8 @@ Every scenario's expected outcome is codified as a pytest assertion in
 1. **(30s)** One-sentence framing: what the problem is, what you built, the
    three-way decision output.
 2. **(60s)** Happy path: run `01_happy_path_nimbus.pdf` live, narrate each
-   stage as it appears (extraction → vendor match → PO match → financial
-   check → decision), point at the reasoning text.
+   stage as it appears (extraction → GST check → vendor match → PO match →
+   financial check → decision), point at the reasoning text.
 3. **(90s)** Edge case 1 — duplicate: run `02_edge_duplicate_coral.pdf`, show
    Approved; run it again, show it flip to Rejected, point at the exact
    "duplicate of invoice X" reason.

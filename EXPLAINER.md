@@ -167,7 +167,32 @@ guessed — it shows a warning and lowers confidence.
 
 ---
 
-## 9. What to actually say in your video (cheat sheet)
+## 9. The second round of upgrades (and why they matter)
+
+- **The AI step is real now, but fenced in.** When the pattern reader can't
+  make sense of a document, a language model reads it. But it only fills
+  blanks (never overwrites), every value it gives must actually appear in the
+  document (so it can't invent a total), it has a spending cap, and if it
+  fails the system just carries on without it. The approve/reject decision is
+  still plain Python. Say it as: "AI reads, rules decide, and I don't trust the
+  AI's answer unless I can find it on the page."
+- **GST checks.** Indian invoices carry a GSTIN with a built-in check character,
+  and the right tax type depends on whether supplier and buyer are in the same
+  state. The system checks both, deterministically. A wrong GSTIN doesn't
+  reject the invoice; it sends it to a person.
+- **Exports.** Download the audit trail as CSV/Excel, and each approved
+  invoice as a "bill" JSON, which is what you would send to an accounting
+  system. It shows what happens after approval.
+- **Batch upload.** Drop many PDFs and get one summary table.
+- **A REST API.** A second way in: another program sends a PDF and gets the
+  decision back as JSON. It is the same engine, so the API and the app always
+  agree. It runs on your computer (Streamlit Cloud only hosts the UI).
+- **Alerts.** If you set a Slack-style webhook, a short message is sent
+  when an invoice needs a person. Off unless configured.
+
+---
+
+## 10. What to actually say in your video (cheat sheet)
 
 You don't need a script — just hit these beats in your own words:
 
