@@ -9,6 +9,7 @@ Two tabs:
     status, and outputs across runs" from the candidate guide.
 """
 import html
+import os
 import time
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from core import database, matching
+from core import ai_assist, database, export, matching, notify
 from core.pipeline import run_pipeline
 from core.workspace import new_session_workspace, reset_reference_data
 
@@ -25,6 +26,15 @@ SAMPLES_DIR = ROOT / "sample_invoices"
 
 st.set_page_config(page_title="Invoice Processing — From PDF to Decision",
                     page_icon="📒", layout="wide")
+
+# Streamlit Cloud exposes secrets as environment variables already; this just
+# makes sure the key is picked up if only st.secrets has it. The key is never
+# displayed or logged anywhere in the app.
+try:
+    if "ANTHROPIC_API_KEY" in st.secrets:
+        os.environ.setdefault("ANTHROPIC_API_KEY", str(st.secrets["ANTHROPIC_API_KEY"]))
+except Exception:
+    pass  # no secrets configured: the app runs fully deterministic
 
 # Every browser session gets its own private workspace (audit trail, vendor
 # master, PO dataset, uploads), so visitors to the deployed app never see or
@@ -197,6 +207,24 @@ def render_result(result) -> None:
     fcol3.metric("Total", f"₹{e.total:,.2f}" if e.total else "—")
     fcol3.metric("Extraction confidence", f"{e.extraction_confidence:.0%}")
 
+    detail_bits = []
+    if e.gstin:
+        detail_bits.append(f"Supplier GSTIN {e.gstin}")
+    if e.currency and e.currency != "INR":
+        detail_bits.append(f"Currency {e.currency}")
+    if e.ai_fields:
+        detail_bits.append("AI-assisted fields: " + ", ".join(ai_assist.FIELD_LABELS[f] for f in e.ai_fields)
+                           + " (each verified against the document text)")
+    if detail_bits:
+        st.caption("  |  ".join(detail_bits))
+
+    run_row = database.get_run(result.invoice_id, ws)
+    bill = export.bill_json_bytes(run_row) if run_row else None
+    if bill:
+        st.download_button("Download bill JSON (accounting hand-off)", bill,
+                           file_name=f"bill_{result.invoice_id}.json", mime="application/json",
+                           key=f"bill_{result.invoice_id}")
+
     with st.expander("Full audit record (JSON)"):
         st.json({
             "invoice_id": result.invoice_id,
@@ -254,6 +282,18 @@ with st.sidebar:
     st.markdown('<p class="section-label">Demo controls</p>', unsafe_allow_html=True)
     live_delay = st.toggle("Simulate live execution delay", value=True,
                             help="Small pause between stages so the run view is watchable during a live demo.")
+    use_ai = st.toggle("Use AI for hard documents", value=True,
+                       help="When on, a language model reads documents the pattern parser can't. Every value it "
+                            "returns must appear in the document text, or it is discarded.")
+    if ai_assist.is_configured():
+        st.caption("AI assist is available. It runs only when extraction is low-confidence or a key field is "
+                   "missing, and the approve / review / reject decision is always plain rules.")
+    else:
+        st.caption("No AI key is configured on this deployment, so extraction is fully deterministic. "
+                   "Try the 09_ai_unusual_layout sample to see what the AI step is for.")
+    if notify.is_enabled():
+        st.caption("Reviewer alerts are on for this deployment: when an invoice needs review, a short notice "
+                   "(file name, vendor, total, first reason) is sent to the app owner's channel.")
     if st.button("Reset reference data to defaults", width='stretch'):
         reset_reference_data(ws)
         flash("success", "Vendor master and PO dataset restored to the defaults.")
@@ -274,12 +314,30 @@ with tab_process:
 
     with col_input:
         st.markdown('<p class="section-label">1 — Provide an invoice</p>', unsafe_allow_html=True)
-        source = st.radio("Source", ["Use a sample invoice", "Upload a PDF"], label_visibility="collapsed")
+        source = st.radio("Source", ["Use a sample invoice", "Upload a PDF", "Upload several PDFs (batch)"],
+                          label_visibility="collapsed")
+        is_batch = source.startswith("Upload several")
 
         pdf_path = None
         filename = None
+        batch_files = []
 
-        if source == "Upload a PDF":
+        if is_batch:
+            uploaded_many = st.file_uploader("Invoice PDFs", type=["pdf"], accept_multiple_files=True)
+            seen_names = set()
+            for up in uploaded_many or []:
+                name = Path(up.name).name
+                stem, n = Path(name).stem, 1
+                while name in seen_names:          # two files with the same name stay two files
+                    n += 1
+                    name = f"{stem}_{n}.pdf"
+                seen_names.add(name)
+                target = ws.uploads_dir / name
+                target.write_bytes(up.getvalue())
+                batch_files.append((str(target), name))
+            if batch_files:
+                st.caption(f"{len(batch_files)} file(s) ready. They are processed one after another, in the order shown.")
+        elif source == "Upload a PDF":
             uploaded = st.file_uploader("Invoice PDF", type=["pdf"])
             if uploaded:
                 filename = Path(uploaded.name).name
@@ -297,6 +355,7 @@ with tab_process:
                 "06_bonus_split_po_part2": "Bonus: second invoice against the same PO — should still Approve via remaining-balance tracking.",
                 "07_bonus_inactive_vendor": "Bonus: vendor exists but is marked inactive -> hard Rejected.",
                 "08_bonus_missing_fields": "Bonus: invoice number and PO reference both missing from the document.",
+                "09_ai_unusual_layout": "AI demo: labels the pattern parser doesn't know. Needs Review without an AI key; read and approved with one.",
             }
             samples = sorted(SAMPLES_DIR.glob("*.pdf"))
             labels = [f.name for f in samples]
@@ -308,15 +367,56 @@ with tab_process:
                 if blurb:
                     st.caption(blurb)
 
-        run_clicked = st.button("▶ Run processing pipeline", type="primary", width='stretch',
-                                 disabled=pdf_path is None)
+        run_clicked = st.button(
+            f"▶ Process {len(batch_files)} invoices" if is_batch else "▶ Run processing pipeline",
+            type="primary", width='stretch',
+            disabled=(not batch_files) if is_batch else (pdf_path is None))
 
     with col_run:
         st.markdown('<p class="section-label">2 — Live execution</p>', unsafe_allow_html=True)
         stage_container = st.container()
         result_container = st.container()
 
-        if run_clicked and pdf_path:
+        if is_batch:
+            if run_clicked and batch_files:
+                rows, bar = [], st.progress(0.0, text="Starting batch...")
+                for i, (path, name) in enumerate(batch_files, start=1):
+                    bar.progress((i - 1) / len(batch_files), text=f"Processing {name} ({i} of {len(batch_files)})")
+                    try:
+                        res = [it for it in run_pipeline(path, name, ws=ws, use_ai=use_ai) if hasattr(it, "decision")][0]
+                        rows.append({"file": name, "decision": res.decision.status,
+                                     "vendor": res.extracted.vendor_name_raw or "—",
+                                     "total": money(res.extracted.total),
+                                     "invoice #": res.extracted.invoice_number or "—",
+                                     "main reason": res.decision.reasons[0] if res.decision.reasons else "",
+                                     "invoice_id": res.invoice_id})
+                    except Exception as err:      # one unreadable file must not stop the rest of the batch
+                        rows.append({"file": name, "decision": "Error", "vendor": "—", "total": "—", "invoice #": "—",
+                                     "main reason": f"Could not process this file ({type(err).__name__}).",
+                                     "invoice_id": ""})
+                bar.progress(1.0, text=f"Finished {len(batch_files)} invoice(s)")
+                st.session_state["batch_results"] = rows
+            batch_rows = st.session_state.get("batch_results")
+            with result_container:
+                if not batch_rows:
+                    st.info("Choose several invoice PDFs on the left, then click **Process**. You get a summary "
+                            "table here, and anything that needs a person lands in the Dashboard's review queue.")
+                else:
+                    bdf = pd.DataFrame(batch_rows)
+                    counts = bdf["decision"].value_counts()
+                    st.markdown(f"""
+                    <div class="ledger-metrics">
+                      <div class="ledger-metric"><div class="num">{len(bdf)}</div><div class="lbl">Processed</div></div>
+                      <div class="ledger-metric c-approved"><div class="num">{int(counts.get('Approved', 0))}</div><div class="lbl">Approved</div></div>
+                      <div class="ledger-metric c-review"><div class="num">{int(counts.get('Needs Review', 0))}</div><div class="lbl">Needs review</div></div>
+                      <div class="ledger-metric c-rejected"><div class="num">{int(counts.get('Rejected', 0))}</div><div class="lbl">Rejected</div></div>
+                    </div>""", unsafe_allow_html=True)
+                    st.dataframe(bdf.drop(columns=["invoice_id"]), hide_index=True, width='stretch')
+                    if int(counts.get("Needs Review", 0)):
+                        st.info("Invoices marked **Needs Review** are waiting in the **Dashboard** tab's review queue.")
+                    st.download_button("Download this batch as CSV", bdf.drop(columns=["invoice_id"]).to_csv(index=False),
+                                       file_name="batch_results.csv", mime="text/csv", key="batch_csv")
+        elif run_clicked and pdf_path:
             stage_container.empty()
             final_result = None
             # All stage rows are accumulated and re-rendered as ONE markdown
@@ -327,7 +427,7 @@ with tab_process:
             with stage_container:
                 placeholder = st.empty()
                 rows_html = []
-                for item in run_pipeline(pdf_path, filename, ws=ws):
+                for item in run_pipeline(pdf_path, filename, ws=ws, use_ai=use_ai):
                     if hasattr(item, "stage"):
                         rows_html.append(stage_row_html(item))
                         placeholder.markdown("".join(rows_html), unsafe_allow_html=True)
@@ -343,8 +443,10 @@ with tab_process:
                 st.markdown("".join(stage_row_html(s) for s in st.session_state["last_result"].stages),
                             unsafe_allow_html=True)
 
-        last_result = st.session_state.get("last_result")
-        if last_result is not None:
+        last_result = None if is_batch else st.session_state.get("last_result")
+        if is_batch:
+            pass
+        elif last_result is not None:
             with result_container:
                 render_result(last_result)
         else:
@@ -409,6 +511,12 @@ with tab_dashboard:
             st.plotly_chart(fig2, width='stretch')
 
         st.markdown('<p class="section-label" style="margin-top:12px;">Processing history</p>', unsafe_allow_html=True)
+        dl1, dl2, _ = st.columns([1, 1, 2])
+        dl1.download_button("Download audit trail (CSV)", export.csv_bytes(history), file_name="audit_trail.csv",
+                            mime="text/csv", width='stretch', key="dl_csv")
+        dl2.download_button("Download Excel (trail + approved bills)", export.excel_bytes(history),
+                            file_name="invoice_audit.xlsx", key="dl_xlsx", width='stretch',
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         display_cols = ["invoice_id", "filename", "vendor_name", "invoice_number", "po_number", "total",
                         "decision_status", "human_decision", "reviewer_note", "confidence", "processed_at"]
         st.dataframe(
@@ -426,5 +534,9 @@ with tab_dashboard:
                 note = f" — {row['reviewer_note']}" if row["reviewer_note"] else ""
                 st.markdown(f"**Reviewer decision:** {row['human_decision']}{note}")
             st.markdown(f"**Reasoning:** {row['decision_reasons']}")
+            picked_bill = export.bill_json_bytes(row.to_dict())
+            if picked_bill:
+                st.download_button("Download bill JSON (accounting hand-off)", picked_bill,
+                                   file_name=f"bill_{picked}.json", mime="application/json", key=f"dl_bill_{picked}")
             with st.expander("Full audit JSON"):
                 st.code(row["full_result_json"], language="json")
