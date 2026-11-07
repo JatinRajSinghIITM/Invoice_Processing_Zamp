@@ -32,7 +32,7 @@ and still passes all tests and edge cases.
 ```bash
 pytest tests/ -v
 ```
-86 unit + integration tests: the tolerance-band math and fuzzy matching in
+88 unit + integration tests: the tolerance-band math and fuzzy matching in
 isolation, 9 regression tests locked in from real-world invoices that broke
 earlier versions of extraction (see *Extraction hardening* below), the full
 pipeline against every sample invoice (happy path + edge cases), per-visitor
@@ -101,10 +101,10 @@ rendered as a stamp, echoing a physical AP workflow.
 
 ## Decision policy (the actual business logic)
 
-- **Rejected**: duplicate of an already-processed invoice · vendor exists but
+- **Rejected**: certain duplicate (same vendor and same invoice number as one already processed) · vendor exists but
   is marked inactive · invoice amount exceeds the PO's *remaining* balance by
   more than 15% (too large to be rounding/freight)
-- **Needs Review**: any critical field missing · vendor not in the master at
+- **Needs Review**: possible duplicate (same vendor, amount and date but a *different* invoice number: two real orders can look like this, so a person decides) · any critical field missing · vendor not in the master at
   all (could be legitimately new) · no PO match found · amount 2–15% over the
   remaining PO balance · overall extraction confidence below 50%
 - **Approved**: approved vendor, PO matched, amount within 2% of the PO's
